@@ -1,30 +1,38 @@
 # genesys-notifications client
 
-This is a simple library for accessing genesys websocket notifications.
+This is a simple library for receiving genesys websocket notifications.
 
 See https://developer.genesys.cloud/api/rest/v2/notifications/notification_service for background.
 
 The library provides:
 
 * channel topic subscriptions
-* channel rollovers when channel expires or times out
+* channel lifetime extension or rollover when it expires
 * convenient access to notifications
-* built-in error handling and recovery
+* built-in error handling and recovery from service interruptions, whether planned or unexpected
 
 The scope of the library is intentionally limited to making single notifications channel management more convenient by encapsulating the above features.
 
-Additional tasks (possibly) required for production applications include:
+It does **not** provide any support for:
 
 * token refresh
 * managing multiple channels
-* notification response processing
+* processing of received notifications
 * accounting for the max 20 channels limit
 * accounting for the 1000 topics per channel subscription limit
 * accounting for the one connection per channel limit
 
-Usage example:
+Usage:
 
-```python3
+First create the Genesys channel as instructed by the Genesys docs. Then:
+
+1. Import and instantiate a Channel, passing in URI and topics.
+1. Await the channel to connect and subscribe.
+1. Iterate over the result to receive notifications.
+
+Example:
+
+```python
 
 >>> uri = "wss://streaming.mypurecloud.com/channels/streaming-0-fmtdmf8cdis7jh14udg5p89t6z"
 >>> topics = ["v2.analytics.queues.tdmf8cd-k3h43h-udg5p89.observations"]
@@ -43,3 +51,12 @@ Usage example:
 }
 ```
 
+Different `ChannelFailure` sub-exceptions may be raised while attempting to:
+
+- connect to a channel
+- subscribe for topics
+- get incoming messages from open channel
+- extend the channel lifetime
+- roll over to new websocket URI
+
+The reason for failure is always available in the `reason` attribute of the raised exception. See `exceptions.REASON` for possible reasons.

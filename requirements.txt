@@ -1,0 +1,4 @@
+websockets
+ujson
+pytest
+pytest-asyncio

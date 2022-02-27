@@ -1,25 +1,50 @@
 from random import choices
 from datetime import datetime, timedelta
 from string import ascii_letters, digits
-import asyncio
 import logging
 import websockets
 import ujson
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, \
+                                  ConnectionClosedOK, InvalidHandshake
+from .exceptions import ChannelFailure, ConnectionFailure, InitializationFailure, \
+                        LifetimeExtensionFailure, ReconnectFailure, \
+                        SubscriptionFailure, RolloverFailure, ChannelExpiring
+from .exceptions import REASON
+from .messages import MESSAGE
 
 
 class Channel:
+    "notifications source with error handling, lifetime extension and rollover"
 
-    def __init__(self, uri, topics, logger=None):
+    @property
+    def expired(self) -> bool:
+        "has the channel exceeded its 24 hour lifetime defined by Genesys"
+        return True if datetime.now() >= self._expiration else False
+
+    @property
+    def connected(self) -> bool:
+        return True if self._connection else False
+
+
+    def __init__(self, uri, topics, extend=True, rollover=23, logger=None):
         self._uri = uri
         self._topics = topics
+        self._extend = extend
         if not logger:
             logging.basicConfig()
-            logger = logging.getLogger(f"channel {uri}")
+            logger = logging.getLogger("channel")
             logger.setLevel(logging.DEBUG)
         self._logger = logger
-        self._expiry = datetime.now() + timedelta(hours=23)
+        self._rollover = 23
+        self._expiration = datetime.now() + timedelta(hours=rollover)
         self._connection = None
+        self._extensions = 0
+        self._rollovers = 0
+        self._status = {
+            "expiration": self._expiration,
+            "extensions": self._extensions,
+            "rollovers": self._rollovers
+        }
 
     def __aiter__(self):
         "return the asynchronous iterable"
@@ -27,56 +52,159 @@ class Channel:
 
     def __await__(self):
         return self.initialize().__await__()
-        
+
     async def __anext__(self):
         "asynchronous iterable implementation"
-        if not self._connection:
-            raise Exception("not connected")
-        if datetime.now() >= self._expiry:
-            await self.initialize()
-        try:
-            msg = await self._connection.recv()
-        except (ConnectionClosed, ConnectionClosedError):
-            await self.initialize()
-            data = await self.__anext__()
-        else:
-            data = ujson.loads(msg)
-            if data["topicName"] == "v2.system.socket_closing":
-                self._logger.debug("received close notification")
-                await self.initialize()
-                data = await self.__anext__()
-                self._logger.info("rolled over due to close notification")
-        finally:
-            return data
+
+        # Initialize if not connected, roll over
+        # if expired or error occurs, stop if
+        # we are already closed.
+
+        if not self.connected:
+            await self.connect()
+
+        if self.expired:
+            raise ChannelExpiring(REASON.ChannelExpired)
+
+        message = None
+
+        while not message:
+            try:
+                data = await self._connection.recv()
+            except ConnectionClosedOK:
+                raise StopAsyncIteration
+            except ConnectionClosedError: # raised also when pingpong times out
+                await self.reconnect()
+                continue
+            else:
+                if data:
+                    try:
+                        message = ujson.loads(data)
+                    except ValueError:
+                        self._logger.error("non-JSON data received: ", data)
+
+        await self.process(message)
+
+
+    async def process(self, msg):
+        "subscription, healtcheck, failure and close handling"
+
+        self._logger.debug(f"received:\n{msg}")
+
+        match msg:
+
+            case {
+                    "topicName": "channel.metadata",
+                    "eventBody":{
+                        "message":"WebSocket Heartbeat"
+                    }
+                }:
+                self._logger.debug("got heartbeat")
+
+            case MESSAGE.CHANNELFAILURE:
+                raise ChannelFailure(REASON.Ambiguous)
+            case MESSAGE.HEALTHOK:
+                self._logger.info("got health check reply")
+            case MESSAGE.CLOSING:
+                self._logger.warning("received close warning, please roll over")
+                if self._extend:
+                    await self.extend()
+                else:
+                    raise ChannelExpiring(REASON.ChannelClosing)
+            case MESSAGE.SUBSCRIBED:
+                self._logger.info("subscription successful")
+
 
     async def connect(self):
-        self._connection = await websockets.connect(self._uri)
-        self._logger.info(f"connected {self._uri}")
+        "open websocket connection"
+        try:
+            self._connection = await websockets.connect(self._uri, ping_timeout=1, ping_interval=1)
+        except InvalidHandshake as exc:
+            raise ConnectionFailure(reason=REASON.InvalidHandshake) from exc
+        else:
+            self._logger.info("connected")
+
 
     async def subscribe(self):
-        if not self._connection:
-            raise Exception("not connected")
+        "subscribe to topics"
+        if not self.connected:
+            raise SubscriptionFailure(REASON.ConnectionClosed)
         correlation_id = ''.join(choices(ascii_letters + digits, k=16))
         subscription = {
             "message":"subscribe",
             "topics": self._topics,
             "correlationId": correlation_id
         }
+        self._logger.debug(f"sending:\n{subscription}")
         await self._connection.send(ujson.dumps(subscription))
-        response = await self._connection.recv()
-        data = ujson.loads(response)
-        if data["correlationId"] == correlation_id:
-            if data["status"] != "subscribed":
-                raise Exception("could not subscribe to topics!")
 
-    async def close(self):
-        if not self._connection:
-            raise Exception("not connected")
-        await self._connection.close()
-        self._connection = None
 
     async def initialize(self):
-        await self.connect()
-        await self.subscribe()
-        self._logger.debug("successfully initialized the channel")
+        "establish websocket connection and subscribe to topics"
+        try:
+            await self.connect()
+            await self.subscribe()
+        except (ConnectionFailure, SubscriptionFailure) as exc:
+            raise InitializationFailure(exc.reason) from exc
+        else:
+            self._logger.debug("successfully initialized the channel")
 
+
+    async def extend(self):
+        "extend channel lifetime by resubscribing to the topics"
+
+        try:
+            await self.subscribe()
+        except SubscriptionFailure as exc:
+            raise LifetimeExtensionFailure(exc.reason) from exc
+        else:
+            self._extensions += 1
+            self._expiration = datetime.now() + timedelta(hours=23)
+            self._logger.debug("successfully extended the channel lifetime")
+
+
+    async def close(self):
+        "close the websocket connection"
+        self._logger.warning("attempting to close the channel now")
+        try:
+            await self._connection.close()
+        except ConnectionClosed:
+            pass
+        self._connection = None
+        self._logger.warning("notification channel is now closed")
+
+
+    async def reconnect(self):
+        "re-establish websocket connection"
+        try:
+            await self.close()
+        except ConnectionClosed:
+            pass
+        try:
+            await self.connect()
+        except ConnectionFailure as exc:
+            raise ReconnectFailure(exc.reason) from exc
+        else:
+            self._logger.debug("successfully re-connected the channel")
+
+
+    async def rollover(self, uri):
+        "re-establish a new connection to a new URI with same subscriptions"
+
+        # keep ref to old connection for closing
+        self._old_connection = self.connection
+
+        # attempt to open the new uri
+        self._uri = uri
+        try:
+            await self.initialize()
+        except InitializationFailure as exc:
+            raise RolloverFailure(exc.reason) from exc
+        else:
+            try:
+                await self._old_connection.close()
+            except ConnectionClosed:
+                pass
+            self._rollovers += 1
+            del self._old_connection
+            self._logger.debug("successfully rolled over to a new URI")
