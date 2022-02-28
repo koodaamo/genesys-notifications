@@ -10,7 +10,6 @@ from .exceptions import ChannelFailure, ConnectionFailure, InitializationFailure
                         LifetimeExtensionFailure, ReconnectFailure, \
                         SubscriptionFailure, RolloverFailure, ChannelExpiring
 from .exceptions import REASON
-from .messages import MESSAGE
 
 
 class Channel:
@@ -87,12 +86,13 @@ class Channel:
 
 
     async def process(self, msg):
-        "subscription, healtcheck, failure and close handling"
+        "handle subscription & healtcheck confirmation, failure and close messages"
 
         self._logger.debug(f"received:\n{msg}")
 
         match msg:
 
+            #  Periodic heartbeat message from Genesys
             case {
                     "topicName": "channel.metadata",
                     "eventBody":{
@@ -101,19 +101,51 @@ class Channel:
                 }:
                 self._logger.debug("got heartbeat")
 
-            case MESSAGE.CHANNELFAILURE:
+            # Failure because
+            # 1) channel has already expired
+            # 2) channel has been replaced by another due to quota overrun
+            # 3) auth token used for the channel has expired
+            case {
+                    "result": "404"
+                }:
                 raise ChannelFailure(REASON.Ambiguous)
-            case MESSAGE.HEALTHOK:
+
+            # Manual health check response
+            case {
+                    "topicName": "channel.metadata",
+                    "eventBody": {
+                        "message": "pong"
+                    }
+                }:
                 self._logger.info("got health check reply")
-            case MESSAGE.CLOSING:
-                self._logger.warning("received close warning, please roll over")
+
+            case {
+                "topicName": "v2.system.socket_closing"
+                }:
+                self._logger.warning("received close warning, extension or rollover required")
                 if self._extend:
                     await self.extend()
                 else:
                     raise ChannelExpiring(REASON.ChannelClosing)
-            case MESSAGE.SUBSCRIBED:
+
+            # Topic(s) subscription responses
+            case  {
+                    "result": "200",
+                    "status": "subscribed"
+                }:
                 self._logger.info("subscription successful")
 
+            case  {
+                    "result": "400",
+                    "status": "failure"
+                }:
+                raise SubscriptionFailure(REASON.Ambiguous)
+
+            case  {
+                    "result": "400",
+                    "status": "error"
+                }:
+                raise SubscriptionFailure(REASON.Ambiguous)
 
     async def connect(self):
         "open websocket connection"
