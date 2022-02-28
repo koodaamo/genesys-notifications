@@ -119,6 +119,9 @@ class Channel:
                 }:
                 self._logger.info("got health check reply")
 
+            # Genesys is going to close the channel in a minute;
+            # try to extend it or raise ChannelExpiring for manual
+            # handling
             case {
                 "topicName": "v2.system.socket_closing"
                 }:
