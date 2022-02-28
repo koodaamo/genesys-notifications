@@ -192,7 +192,7 @@ class Channel:
         "re-establish a new connection to a new URI with same subscriptions"
 
         # keep ref to old connection for closing
-        self._old_connection = self.connection
+        self._old_connection = self._connection
 
         # attempt to open the new uri
         self._uri = uri
