@@ -106,9 +106,10 @@ class Channel:
             # 2) channel has been replaced by another due to quota overrun
             # 3) auth token used for the channel has expired
             case {
-                    "result": "404"
+                    "result": "404",
+                    "message": msg
                 }:
-                raise ChannelFailure(REASON.Ambiguous)
+                raise ChannelFailure(REASON.Ambiguous, message=msg)
 
             # Manual health check response
             case {
@@ -140,15 +141,17 @@ class Channel:
 
             case  {
                     "result": "400",
-                    "status": "failure"
+                    "status": "failure",
+                    "message": msg
                 }:
-                raise SubscriptionFailure(REASON.Ambiguous)
+                raise SubscriptionFailure(REASON.Ambiguous, message=msg)
 
             case  {
                     "result": "400",
-                    "status": "error"
+                    "status": "error",
+                    "message": msg
                 }:
-                raise SubscriptionFailure(REASON.Ambiguous)
+                raise SubscriptionFailure(REASON.Ambiguous, message=msg)
 
     async def connect(self):
         "open websocket connection"

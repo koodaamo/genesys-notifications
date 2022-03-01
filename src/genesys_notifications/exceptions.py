@@ -1,38 +1,44 @@
 from enum import Enum
 
+# Exception reason codes; see the websockets library error 
+# reference and Genesys notification system docs.
 
 class REASON(Enum):
-    ConnectionClosed = 1 # see websockets error referenc
-    InvalidHandshake = 2 # see websockets error reference
-    InvalidURI = 3 # see websockets error reference
-    PayloadTooBig = 4 # see websockets error reference
-    ProtocolFailure = 5 # see websockets error reference
+    ConnectionClosed = 1
+    InvalidHandshake = 2
+    InvalidURI = 3
+    PayloadTooBig = 4
+    ProtocolFailure = 5
     TokenExpired = 6 # Genesys token used to create the channel has expired
-    ChannelExpired = 7 # 24 hrs has passed since channel creation
+    ChannelExpired = 7 # 24 hrs has passed since Genesys channel creation
     ChannelClosing = 8 # Genesys is closing the channel in one minute
-    Ambiguous = 9 # Unknown or ambiguous
+    Ambiguous = 9 # Unknown or ambiguous reason
 
 
 class ChannelException(Exception):
-    ""
+    "The base exception for subclassing"
 
-class ChannelExpiring(ChannelException):
-    "Channel is expiring because of end of life or ad-hoc close"
-
-
-# Failures that should be caught
-
-class ChannelFailure(ChannelException):
-    "Notifications channel operation failed"
-
-    def __init__(self, reason: REASON):
+    def __init__(self, reason: REASON, message=None):
         self.reason = reason
+        self.message = message
 
     def __str__(self):
         return self.__doc__
 
 
-# Initialization failure exceptions
+# Channel expiry
+
+class ChannelExpiring(ChannelException):
+    "Channel is expiring because of end of life or ad-hoc close"
+
+
+# Channel failures
+
+class ChannelFailure(ChannelException):
+    "Base exception for notifications channel failures"
+
+
+# Channel initialization failures
 
 class InitializationFailure(ChannelFailure):
     "Websocket connection or topic subscription failed"
@@ -44,13 +50,13 @@ class SubscriptionFailure(InitializationFailure):
     "Could not subscribe to notification topic(s)"
 
 
-# Notification reception failure  exceptions
+# Channel notification reception failures
 
 class ReceiveFailure(ChannelFailure):
     "Failure to receive data while listening on open channel"
 
 
-# Channel recovery failure exceptions
+# Channel recovery failures
 
 class RecoveryFailure(ChannelFailure):
     "Could not recover from channel failure"
