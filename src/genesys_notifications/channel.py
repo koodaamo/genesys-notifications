@@ -5,10 +5,11 @@ import logging
 import websockets
 import ujson
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, \
-                                  ConnectionClosedOK, InvalidHandshake
-from .exceptions import ChannelFailure, ConnectionFailure, InitializationFailure, \
-                        LifetimeExtensionFailure, ReconnectFailure, \
-                        SubscriptionFailure, RolloverFailure, ChannelExpiring
+                                  ConnectionClosedOK, InvalidStatusCode, InvalidURI
+from .exceptions import ChannelFailure, ConnectionFailure, AuthorizationFailure, \
+                        InitializationFailure, LifetimeExtensionFailure, \
+                        ReconnectFailure, SubscriptionFailure, RolloverFailure, \
+                        ChannelExpiring, ReceiveFailure
 from .exceptions import REASON
 
 
@@ -75,12 +76,14 @@ class Channel:
             except ConnectionClosedError: # raised also when pingpong times out
                 await self.reconnect()
                 continue
+            except WebSocketException as exc:
+                raise ReceiveFailure(reason=REASON.Ambiguous, original=exc) from exc
             else:
                 if data:
                     try:
                         message = ujson.loads(data)
                     except ValueError:
-                        self._logger.error("non-JSON data received: ", data)
+                        raise ReceiveFailure(reason=REASON.InvalidMessage)
 
         await self.process(message)
 
@@ -157,8 +160,17 @@ class Channel:
         "open websocket connection"
         try:
             self._connection = await websockets.connect(self._uri, ping_timeout=1, ping_interval=1)
-        except InvalidHandshake as exc:
-            raise ConnectionFailure(reason=REASON.InvalidHandshake) from exc
+        except InvalidURI as exc:
+            raise ConnectionFailure(reason=REASON.InvalidURI, original=exc) from exc
+        except InvalidStatusCode as exc:
+            if exc.status_code == 401:
+                raise AuthorizationFailure(reason=REASON.HTTPUnauthorized, original=exc) from exc
+            elif exc.status_code == 403:
+                raise AuthorizationFailure(reason=REASON.HTTPForbidden, original=exc) from exc
+            else:
+                raise ConnectionFailure(reason=REASON.InvalidStatusCode, original=exc) from exc
+        except WebSocketException as exc:
+            raise ConnectionFailure(reason=REASON.Ambiguous, original=exc) from exc
         else:
             self._logger.info("connected")
 
@@ -183,7 +195,7 @@ class Channel:
             await self.connect()
             await self.subscribe()
         except (ConnectionFailure, SubscriptionFailure) as exc:
-            raise InitializationFailure(exc.reason) from exc
+            raise InitializationFailure(exc.reason, original=exc) from exc
         else:
             self._logger.debug("successfully initialized the channel")
 
@@ -221,7 +233,7 @@ class Channel:
         try:
             await self.connect()
         except ConnectionFailure as exc:
-            raise ReconnectFailure(exc.reason) from exc
+            raise ReconnectFailure(exc.reason, original=exc) from exc
         else:
             self._logger.debug("successfully re-connected the channel")
 

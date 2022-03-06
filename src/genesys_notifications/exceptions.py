@@ -1,29 +1,33 @@
 from enum import Enum
 
-# Exception reason codes; see the websockets library error 
+# Exception reason codes; see the websockets library error
 # reference and Genesys notification system docs.
+# Reason hierarchy is indicated by number of digits when applicable,
+# e.g. InvalidHandshake -> InvalidStatusCode -> HTTPUnauthorized.
 
 class REASON(Enum):
-    ConnectionClosed = 1
-    InvalidHandshake = 2
-    InvalidURI = 3
-    PayloadTooBig = 4
-    ProtocolFailure = 5
-    TokenExpired = 6 # Genesys token used to create the channel has expired
-    ChannelExpired = 7 # 24 hrs has passed since Genesys channel creation
-    ChannelClosing = 8 # Genesys is closing the channel in one minute
-    Ambiguous = 9 # Unknown or ambiguous reason
+    ConnectionClosed = 1 # as defined in websockets
+    InvalidHandshake = 2 # as defined in websockets
+    InvalidStatusCode = 21 # as defined in websockets
+    HTTPUnauthorized = 211
+    HTTPForbidden = 212
+    InvalidURI = 3 # as defined in websockets
+    InvalidMessage = 4 # could not parse JSON
+    ChannelExpired = 5 # 24 hrs has passed since Genesys channel creation
+    ChannelClosing = 6 # Genesys is closing the channel in one minute
+    Ambiguous = 7 # Unknown or ambiguous reason
 
 
 class ChannelException(Exception):
     "The base exception for subclassing"
 
-    def __init__(self, reason: REASON, message=None):
+    def __init__(self, reason: REASON, message=None, original=None):
         self.reason = reason
         self.message = message
+        self.original = original
 
     def __str__(self):
-        return self.__doc__
+        return "%s: %s: %s" % (self.__class__.__name__, self.__doc__, self.reason.name)
 
 
 # Channel expiry
@@ -45,6 +49,9 @@ class InitializationFailure(ChannelFailure):
 
 class ConnectionFailure(InitializationFailure):
     "Could not open websocket channel connection"
+
+class AuthorizationFailure(ConnectionFailure):
+    "Connection was rejected"
 
 class SubscriptionFailure(InitializationFailure):
     "Could not subscribe to notification topic(s)"
