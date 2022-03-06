@@ -5,7 +5,8 @@ import logging
 import websockets
 import ujson
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, \
-                                  ConnectionClosedOK, InvalidStatusCode, InvalidURI
+                                  ConnectionClosedOK, InvalidStatusCode, \
+                                  InvalidURI, WebSocketException
 from .exceptions import ChannelFailure, ConnectionFailure, AuthorizationFailure, \
                         InitializationFailure, LifetimeExtensionFailure, \
                         ReconnectFailure, SubscriptionFailure, RolloverFailure, \
