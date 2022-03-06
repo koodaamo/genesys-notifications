@@ -1,3 +1,4 @@
+from email import message
 from random import choices
 from datetime import datetime, timedelta
 from string import ascii_letters, digits
@@ -67,9 +68,9 @@ class Channel:
         if self.expired:
             raise ChannelExpiring(REASON.ChannelExpired)
 
-        message = None
+        notification = None
 
-        while not message:
+        while not notification:
             try:
                 data = await self._connection.recv()
             except ConnectionClosedOK:
@@ -85,8 +86,9 @@ class Channel:
                         message = ujson.loads(data)
                     except ValueError:
                         raise ReceiveFailure(reason=REASON.InvalidMessage)
-
-        await self.process(message)
+                    else:
+                        notification = await self.process(message)
+        return notification
 
 
     async def process(self, msg):
@@ -156,6 +158,11 @@ class Channel:
                     "message": msg
                 }:
                 raise SubscriptionFailure(REASON.Ambiguous, message=msg)
+
+            # nothing matched so actual notification data; pass it thru
+            case _:
+                return msg
+
 
     async def connect(self):
         "open websocket connection"
