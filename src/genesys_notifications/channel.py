@@ -37,7 +37,7 @@ class Channel:
             logger = logging.getLogger("channel")
             logger.setLevel(logging.DEBUG)
         self._logger = logger
-        self._rollover = 23
+        self._rollover = rollover
         self._expiration = datetime.now() + timedelta(hours=rollover)
         self._connection = None
         self._extensions = 0
@@ -66,7 +66,11 @@ class Channel:
             await self.connect()
 
         if self.expired:
-            raise ChannelExpiring(REASON.ChannelExpired)
+            if self._extend:
+                await self.extend()
+            else:
+                raise ChannelExpiring(REASON.ChannelExpired)
+
 
         notification = None
 
@@ -217,7 +221,7 @@ class Channel:
             raise LifetimeExtensionFailure(exc.reason) from exc
         else:
             self._extensions += 1
-            self._expiration = datetime.now() + timedelta(hours=23)
+            self._expiration = datetime.now() + timedelta(hours=self._rollover)
             self._logger.debug("successfully extended the channel lifetime")
 
 
@@ -259,6 +263,7 @@ class Channel:
         except InitializationFailure as exc:
             raise RolloverFailure(exc.reason) from exc
         else:
+            self._expiration = datetime.now() + timedelta(hours=self._rollover)
             try:
                 await self._old_connection.close()
             except ConnectionClosed:
