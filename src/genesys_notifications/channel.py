@@ -1,4 +1,4 @@
-from email import message
+import asyncio
 from random import choices
 from datetime import datetime, timedelta
 from string import ascii_letters, digits
@@ -28,25 +28,20 @@ class Channel:
         return True if self._connection else False
 
 
-    def __init__(self, uri, topics, extend=True, rollover=23, logger=None):
+    def __init__(self, uri, topics, lifetime=82800, autoextend=True, logger=None):
         self._uri = uri
         self._topics = topics
-        self._extend = extend
+        self._autoextend = autoextend
         if not logger:
             logging.basicConfig()
             logger = logging.getLogger("channel")
             logger.setLevel(logging.DEBUG)
         self._logger = logger
-        self._rollover = rollover
-        self._expiration = datetime.now() + timedelta(hours=rollover)
+        self._lifetime = lifetime
+        self._expiration =  datetime.now() + timedelta(seconds=self._lifetime)
         self._connection = None
         self._extensions = 0
         self._rollovers = 0
-        self._status = {
-            "expiration": self._expiration,
-            "extensions": self._extensions,
-            "rollovers": self._rollovers
-        }
 
     def __aiter__(self):
         "return the asynchronous iterable"
@@ -56,27 +51,28 @@ class Channel:
         return self.initialize().__await__()
 
     async def __anext__(self):
-        "asynchronous iterable implementation"
-
-        # Initialize if not connected, roll over
-        # if expired or error occurs, stop if
-        # we are already closed.
-
-        if not self.connected:
-            await self.connect()
-
-        if self.expired:
-            if self._extend:
-                await self.extend()
-            else:
-                raise ChannelExpiring(REASON.ChannelExpired)
-
+        "asynchronous iterable, blocks until it gets data or managed expiry is triggered"
 
         notification = None
 
         while not notification:
+
+            # wait for either data to arrive or expiry getting triggered
+            (done, _) = await asyncio.wait((self._expiretrigger, self._connection.recv()), return_when=asyncio.FIRST_COMPLETED)
+
+            # perform managed expiry when triggered
+            if self._expiretrigger in done:
+                _.pop().cancel()
+                self._logger.warning("managed expiry triggered")
+                if self._autoextend:
+                    await self.extend()
+                    continue
+                else:
+                    raise ChannelExpiring(REASON.ChannelExpired)
+
+            # otherwise, it's the data receive event, handle it
             try:
-                data = await self._connection.recv()
+                data = done.pop().result()
             except ConnectionClosedOK:
                 raise StopAsyncIteration
             except ConnectionClosedError: # raised also when pingpong times out
@@ -85,13 +81,14 @@ class Channel:
             except WebSocketException as exc:
                 raise ReceiveFailure(reason=REASON.Ambiguous, original=exc) from exc
             else:
-                if data:
-                    try:
-                        message = ujson.loads(data)
-                    except ValueError:
-                        raise ReceiveFailure(reason=REASON.InvalidMessage)
-                    else:
-                        notification = await self.process(message)
+                try:
+                    message = ujson.loads(data)
+                except ValueError:
+                    raise ReceiveFailure(reason=REASON.InvalidMessage)
+                else:
+                    notification = await self.process(message)
+
+        # release successfully retrieved message for processing
         return notification
 
 
@@ -137,7 +134,7 @@ class Channel:
                 "topicName": "v2.system.socket_closing"
                 }:
                 self._logger.warning("received close warning, extension or rollover required")
-                if self._extend:
+                if self._autoextend:
                     await self.extend()
                 else:
                     raise ChannelExpiring(REASON.ChannelClosing)
@@ -147,7 +144,7 @@ class Channel:
                     "result": "200",
                     "status": "subscribed"
                 }:
-                self._logger.info("subscription successful")
+                self._logger.info("topic subscription successful")
 
             case  {
                     "result": "400",
@@ -210,6 +207,7 @@ class Channel:
             raise InitializationFailure(exc.reason, original=exc) from exc
         else:
             self._logger.debug("successfully initialized the channel")
+            await self.schedule_expiry()
 
 
     async def extend(self):
@@ -221,8 +219,8 @@ class Channel:
             raise LifetimeExtensionFailure(exc.reason) from exc
         else:
             self._extensions += 1
-            self._expiration = datetime.now() + timedelta(hours=self._rollover)
-            self._logger.debug("successfully extended the channel lifetime")
+            self._logger.debug("successfully extended the channel lifetime (round %i)", self._extensions)
+            await self.schedule_expiry()
 
 
     async def close(self):
@@ -263,11 +261,20 @@ class Channel:
         except InitializationFailure as exc:
             raise RolloverFailure(exc.reason) from exc
         else:
-            self._expiration = datetime.now() + timedelta(hours=self._rollover)
             try:
                 await self._old_connection.close()
             except ConnectionClosed:
                 pass
             self._rollovers += 1
             del self._old_connection
-            self._logger.debug("successfully rolled over to a new URI")
+            self._logger.debug("successfully rolled over to a new URI (round %i)", self._rollovers)
+
+
+    async def schedule_expiry(self):
+        try:
+            self._expiretrigger.cancel()
+        except:
+            pass
+        self._expiretrigger = asyncio.create_task(asyncio.sleep(self._lifetime))
+        self._expiration = datetime.now() + timedelta(seconds=self._lifetime)
+        self._logger.info("next managed expiry scheduled at %s", self._expiration.isoformat(" ", timespec="seconds"))
