@@ -127,33 +127,29 @@ class Channel:
                 }:
                 self._logger.info("got health check reply")
 
-            # Genesys is going to close the channel in a minute;
-            # try to extend it or raise ChannelExpiring for manual
-            # handling
+            # Genesys is going to close the connection in a minute;
+            # raise ChannelExpiring to signal need for rollover
             case {
-                "topicName": "v2.system.socket_closing"
+                    "topicName": "v2.system.socket_closing"
                 }:
-                self._logger.warning("received close warning, extension or rollover required")
-                if self._autoextend:
-                    await self.extend()
-                else:
-                    raise ChannelExpiring(REASON.ChannelClosing)
+                self._logger.warning("received close warning, rollover required to avoid channel shutdown")
+                raise ChannelExpiring(REASON.ChannelClosing)
 
             # Topic(s) subscription responses
-            case  {
+            case {
                     "result": "200",
                     "status": "subscribed"
                 }:
                 self._logger.info("topic subscription successful")
 
-            case  {
+            case {
                     "result": "400",
                     "status": "failure",
                     "message": msg
                 }:
                 raise SubscriptionFailure(REASON.Ambiguous, message=msg)
 
-            case  {
+            case {
                     "result": "400",
                     "status": "error",
                     "message": msg
