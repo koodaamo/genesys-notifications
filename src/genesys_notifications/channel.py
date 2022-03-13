@@ -5,13 +5,12 @@ from string import ascii_letters, digits
 import logging
 import websockets
 import ujson
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError, \
-                                  ConnectionClosedOK, InvalidStatusCode, \
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode, \
                                   InvalidURI, WebSocketException
 from .exceptions import ChannelFailure, ConnectionFailure, AuthorizationFailure, \
                         InitializationFailure, LifetimeExtensionFailure, \
                         ReconnectFailure, SubscriptionFailure, RolloverFailure, \
-                        ChannelExpiring, ReceiveFailure
+                        ChannelExpiring, ReceiveFailure, RecoveryFailure
 from .exceptions import REASON
 
 
@@ -28,10 +27,11 @@ class Channel:
         return True if self._connection else False
 
 
-    def __init__(self, uri, topics, lifetime=82800, autoextend=True, logger=None):
+    def __init__(self, uri, topics, lifetime=82800, autoextend=True, reconnect=True, logger=None):
         self._uri = uri
         self._topics = topics
         self._autoextend = autoextend
+        self._reconnect = reconnect
         if not logger:
             logging.basicConfig()
             logger = logging.getLogger("channel")
@@ -55,6 +55,7 @@ class Channel:
 
         notification = None
 
+        # run in a lopp here so that successful recovery can happen transparently from upstream point of view
         while not notification:
 
             # wait for either data to arrive or expiry getting triggered
@@ -70,29 +71,34 @@ class Channel:
                 else:
                     raise ChannelExpiring(REASON.ChannelExpired)
 
-            # otherwise, it's the data receive event, handle it
+            # otherwise, we got data or failure, handle it
             try:
                 data = done.pop().result()
-            except ConnectionClosedOK:
-                raise StopAsyncIteration
-            except ConnectionClosedError: # raised also when pingpong times out
-                await self.reconnect()
-                continue
             except WebSocketException as exc:
-                raise ReceiveFailure(reason=REASON.Ambiguous, original=exc) from exc
+                self._logger.error("unexpected connection failure: %s", type(exc).__name__)
+                if self._reconnect:
+                    try:
+                        await self.reconnect()
+                    except WebSocketException as exc:
+                        self._logger.error("could not recover from connection failure: %s", type(exc).__name__)
+                        raise RecoveryFailure(reason=REASON.Ambiguous, original=exc) from exc
+                    else:
+                        self._logger.info("successfully recovered from connection failure")
+                        continue
             else:
                 try:
                     message = ujson.loads(data)
                 except ValueError:
+                    self._logger.debug("invalid data received: %s", data)
                     raise ReceiveFailure(reason=REASON.InvalidMessage)
                 else:
-                    notification = await self.process(message)
+                    notification = self.process(message)
 
         # release successfully retrieved message for processing
         return notification
 
 
-    async def process(self, msg):
+    def process(self, msg):
         "handle subscription & healtcheck confirmation, failure and close messages"
 
         self._logger.debug(f"received:\n{msg}")
@@ -236,12 +242,14 @@ class Channel:
             await self.close()
         except ConnectionClosed:
             pass
+        self._logger.debug("attempting to reconnect the channel")
         try:
             await self.connect()
         except ConnectionFailure as exc:
+            self._logger.error("could not reconnect the channel")
             raise ReconnectFailure(exc.reason, original=exc) from exc
         else:
-            self._logger.debug("successfully re-connected the channel")
+            self._logger.info("successfully re-connected the channel")
 
 
     async def rollover(self, uri):
