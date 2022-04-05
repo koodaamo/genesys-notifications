@@ -75,27 +75,38 @@ class Channel:
             try:
                 data = done.pop().result()
             except WebSocketException as exc:
-                self._logger.error("unexpected connection failure: %s", type(exc).__name__)
-                if self._reconnect:
-                    try:
-                        await self.reconnect()
-                    except WebSocketException as exc:
-                        self._logger.error("could not recover from connection failure: %s", type(exc).__name__)
-                        raise RecoveryFailure(reason=REASON.Ambiguous, original=exc) from exc
-                    else:
-                        self._logger.info("successfully recovered from connection failure")
-                        continue
+                recovered = await self.handle_websocket_failure(exc)
+                if recovered:
+                    continue
             else:
                 try:
                     message = ujson.loads(data)
                 except ValueError:
-                    self._logger.debug("invalid data received: %s", data)
-                    raise ReceiveFailure(reason=REASON.InvalidMessage)
+                    self.handle_invalid_json(data)
                 else:
                     notification = self.process(message)
 
         # release successfully retrieved message for processing
         return notification
+
+
+    async def handle_websocket_failure(self, exc):
+        self._logger.error("unexpected connection failure: %s", type(exc).__name__)
+        if self._reconnect:
+            try:
+                await self.reconnect()
+            except WebSocketException as exc:
+                self._logger.error("could not recover from connection failure: %s", type(exc).__name__)
+                raise RecoveryFailure(reason=REASON.Ambiguous, original=exc) from exc
+            else:
+                self._logger.info("successfully recovered from connection failure")
+                return True
+        else:
+            raise ReceiveFailure(reason=REASON.Ambiguous, original=exc) from exc
+
+    def handle_invalid_json(self, data):
+        self._logger.debug("invalid data received: %s", data)
+        raise ReceiveFailure(reason=REASON.InvalidMessage)
 
 
     def process(self, msg):
@@ -157,7 +168,6 @@ class Channel:
             # nothing matched so actual notification data; pass it thru
             case _:
                 return msg
-
 
     def handle_heartbeat(self):
         self._logger.debug("got heartbeat")
