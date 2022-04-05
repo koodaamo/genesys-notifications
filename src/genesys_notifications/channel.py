@@ -50,6 +50,52 @@ class Channel:
     def __await__(self):
         return self.initialize().__await__()
 
+
+    async def initialize(self):
+        "establish websocket connection and subscribe to topics"
+        try:
+            await self.connect()
+            await self.subscribe()
+        except (ConnectionFailure, SubscriptionFailure) as exc:
+            raise InitializationFailure(exc.reason, original=exc) from exc
+        else:
+            self._logger.debug("successfully initialized the channel")
+            await self.schedule_expiry()
+
+
+    async def connect(self):
+        "open websocket connection"
+        try:
+            self._connection = await websockets.connect(self._uri, ping_timeout=1, ping_interval=1)
+        except InvalidURI as exc:
+            raise ConnectionFailure(reason=REASON.InvalidURI, original=exc) from exc
+        except InvalidStatusCode as exc:
+            if exc.status_code == 401:
+                raise AuthorizationFailure(reason=REASON.HTTPUnauthorized, original=exc) from exc
+            elif exc.status_code == 403:
+                raise AuthorizationFailure(reason=REASON.HTTPForbidden, original=exc) from exc
+            else:
+                raise ConnectionFailure(reason=REASON.InvalidStatusCode, original=exc) from exc
+        except WebSocketException as exc:
+            raise ConnectionFailure(reason=REASON.Ambiguous, original=exc) from exc
+        else:
+            self._logger.info("connected")
+
+
+    async def subscribe(self):
+        "subscribe to topics"
+        if not self.connected:
+            raise SubscriptionFailure(REASON.ConnectionClosed)
+        correlation_id = ''.join(choices(ascii_letters + digits, k=16))
+        subscription = {
+            "message":"subscribe",
+            "topics": self._topics,
+            "correlationId": correlation_id
+        }
+        self._logger.debug(f"sending:\n{subscription}")
+        await self._connection.send(ujson.dumps(subscription))
+
+
     async def __anext__(self):
         "asynchronous iterable, blocks until it gets data or managed expiry is triggered"
 
@@ -187,51 +233,6 @@ class Channel:
 
     def handle_subscription_failure(self, msg):
         raise SubscriptionFailure(REASON.Ambiguous, message=msg)
-
-
-    async def connect(self):
-        "open websocket connection"
-        try:
-            self._connection = await websockets.connect(self._uri, ping_timeout=1, ping_interval=1)
-        except InvalidURI as exc:
-            raise ConnectionFailure(reason=REASON.InvalidURI, original=exc) from exc
-        except InvalidStatusCode as exc:
-            if exc.status_code == 401:
-                raise AuthorizationFailure(reason=REASON.HTTPUnauthorized, original=exc) from exc
-            elif exc.status_code == 403:
-                raise AuthorizationFailure(reason=REASON.HTTPForbidden, original=exc) from exc
-            else:
-                raise ConnectionFailure(reason=REASON.InvalidStatusCode, original=exc) from exc
-        except WebSocketException as exc:
-            raise ConnectionFailure(reason=REASON.Ambiguous, original=exc) from exc
-        else:
-            self._logger.info("connected")
-
-
-    async def subscribe(self):
-        "subscribe to topics"
-        if not self.connected:
-            raise SubscriptionFailure(REASON.ConnectionClosed)
-        correlation_id = ''.join(choices(ascii_letters + digits, k=16))
-        subscription = {
-            "message":"subscribe",
-            "topics": self._topics,
-            "correlationId": correlation_id
-        }
-        self._logger.debug(f"sending:\n{subscription}")
-        await self._connection.send(ujson.dumps(subscription))
-
-
-    async def initialize(self):
-        "establish websocket connection and subscribe to topics"
-        try:
-            await self.connect()
-            await self.subscribe()
-        except (ConnectionFailure, SubscriptionFailure) as exc:
-            raise InitializationFailure(exc.reason, original=exc) from exc
-        else:
-            self._logger.debug("successfully initialized the channel")
-            await self.schedule_expiry()
 
 
     async def extend(self):
