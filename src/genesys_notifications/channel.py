@@ -99,7 +99,7 @@ class Channel:
 
 
     def process(self, msg):
-        "handle subscription & healtcheck confirmation, failure and close messages"
+        "process JSON messages received over websocket from Genesys"
 
         self._logger.debug(f"received:\n{msg}")
 
@@ -112,7 +112,7 @@ class Channel:
                         "message":"WebSocket Heartbeat"
                     }
                 }:
-                self._logger.debug("got heartbeat")
+                self.handle_heartbeat()
 
             # Failure because
             # 1) channel has already expired
@@ -122,7 +122,7 @@ class Channel:
                     "result": "404",
                     "message": msg
                 }:
-                raise ChannelFailure(REASON.Ambiguous, message=msg)
+                self.handle_404(msg)
 
             # Manual health check response
             case {
@@ -131,40 +131,52 @@ class Channel:
                         "message": "pong"
                     }
                 }:
-                self._logger.info("got health check reply")
+                self.handle_healthcheck_reply()
 
             # Genesys is going to close the connection in a minute;
             # raise ChannelExpiring to signal need for rollover
             case {
                     "topicName": "v2.system.socket_closing"
                 }:
-                self._logger.warning("received close warning, rollover required to avoid channel shutdown")
-                raise ChannelExpiring(REASON.ChannelClosing)
+                self.handle_close_warning()
 
             # Topic(s) subscription responses
             case {
                     "result": "200",
                     "status": "subscribed"
                 }:
-                self._logger.info("topic subscription successful")
+                self.handle_subscription_success()
 
             case {
                     "result": "400",
-                    "status": "failure",
+                    "status": "failure" | "error",
                     "message": msg
                 }:
-                raise SubscriptionFailure(REASON.Ambiguous, message=msg)
-
-            case {
-                    "result": "400",
-                    "status": "error",
-                    "message": msg
-                }:
-                raise SubscriptionFailure(REASON.Ambiguous, message=msg)
+                self.handle_subscription_failure(msg)
 
             # nothing matched so actual notification data; pass it thru
             case _:
                 return msg
+
+
+    def handle_heartbeat(self):
+        self._logger.debug("got heartbeat")
+
+    def handle_404(self, msg):
+        raise ChannelFailure(REASON.Ambiguous, message=msg)
+
+    def handle_healthcheck_reply(self):
+        self._logger.info("got health check reply")
+
+    def handle_close_warning(self):
+        self._logger.warning("received close warning, rollover required to avoid channel shutdown")
+        raise ChannelExpiring(REASON.ChannelClosing)
+
+    def handle_subscription_success(self):
+        self._logger.info("topic subscription successful")
+
+    def handle_subscription_failure(self, msg):
+        raise SubscriptionFailure(REASON.Ambiguous, message=msg)
 
 
     async def connect(self):
