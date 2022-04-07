@@ -4,13 +4,15 @@ This is a simple library for receiving genesys websocket notifications.
 
 See https://developer.genesys.cloud/api/rest/v2/notifications/notification_service for background.
 
-The library provides:
+The library provides a notifications Channel implementation that encapsulates the websocket
+connection management. Features:
 
 * channel connection & topic subscriptions
-* async iterator for notifications
+* async iterator for getting notifications
 * automatic channel reconnect on failure
-* helpful custom exceptions whenever recovery is not possible
-* automatic channel lifetime extension or rollover when expiring or closing for maintenance [^1]
+* helpful custom exceptions
+* automatic channel lifetime extension to avoid channel expiry
+* support for rollover to a new connection when channel expires or closes for maintenance [^1]
 
 The scope of the library is intentionally limited to making single notifications channel management more convenient by encapsulating the above features.
 

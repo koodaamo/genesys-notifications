@@ -1,3 +1,11 @@
+1.4 (unreleased)
+-----------------
+
+- Better support for subclassing
+- Improved timeouts handling with help from the "Pending" package
+- README clarification
+- Add support for manual health check
+
 1.3 (2022-03-13)
 -----------------
 
