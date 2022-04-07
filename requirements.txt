@@ -2,3 +2,4 @@ websockets
 ujson
 pytest
 pytest-asyncio
+pending

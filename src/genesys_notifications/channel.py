@@ -7,11 +7,13 @@ import websockets
 import ujson
 from websockets.exceptions import ConnectionClosed, InvalidStatusCode, \
                                   InvalidURI, WebSocketException
+from pending import Pending
 from .exceptions import ChannelFailure, ConnectionFailure, AuthorizationFailure, \
                         InitializationFailure, LifetimeExtensionFailure, \
                         ReconnectFailure, SubscriptionFailure, RolloverFailure, \
                         ChannelExpiring, ReceiveFailure, RecoveryFailure
 from .exceptions import REASON
+from .timeouts import TIMEOUT
 
 
 class Channel:
@@ -20,7 +22,7 @@ class Channel:
     @property
     def expired(self) -> bool:
         "has the channel exceeded its 24 hour lifetime defined by Genesys"
-        return True if datetime.now() >= self._expiration else False
+        return True if datetime.now() >= self._timeouts[TIMEOUT.ChannelExpired].expected else False
 
     @property
     def connected(self) -> bool:
@@ -38,7 +40,9 @@ class Channel:
             logger.setLevel(logging.DEBUG)
         self._logger = logger
         self._lifetime = lifetime
-        self._expiration =  datetime.now() + timedelta(seconds=self._lifetime)
+        self._heartbeat_timeout = 40
+        self._response_timeout = 7
+        self._timeouts = Pending()
         self._connection = None
         self._extensions = 0
         self._rollovers = 0
@@ -53,14 +57,16 @@ class Channel:
 
     async def initialize(self):
         "establish websocket connection and subscribe to topics"
+        self._timeouts = Pending()
         try:
             await self.connect()
             await self.subscribe()
         except (ConnectionFailure, SubscriptionFailure) as exc:
             raise InitializationFailure(exc.reason, original=exc) from exc
         else:
+            self._timeouts.schedule(TIMEOUT.ChannelExpired, self._lifetime)
+            self._timeouts.schedule(TIMEOUT.NoHeartbeat, self._heartbeat_timeout)
             self._logger.debug("successfully initialized the channel")
-            await self.schedule_expiry()
 
 
     async def connect(self):
@@ -94,10 +100,11 @@ class Channel:
         }
         self._logger.debug(f"sending:\n{subscription}")
         await self._connection.send(ujson.dumps(subscription))
+        self._timeouts.schedule(TIMEOUT.NoSubscriptionConfirmation, self._response_timeout)
 
 
     async def __anext__(self):
-        "asynchronous iterable, blocks until it gets data or managed expiry is triggered"
+        "asynchronous iterable for getting Notifications Channel JSON messages over websocket"
 
         notification = None
 
@@ -105,26 +112,22 @@ class Channel:
         while not notification:
 
             # wait for either data to arrive or expiry getting triggered
-            (done, _) = await asyncio.wait((self._expiretrigger, self._connection.recv()), return_when=asyncio.FIRST_COMPLETED)
-
-            # perform managed expiry when triggered
-            if self._expiretrigger in done:
-                _.pop().cancel()
-                self._logger.warning("managed expiry triggered")
-                if self._autoextend:
-                    await self.extend()
-                    continue
-                else:
-                    raise ChannelExpiring(REASON.ChannelExpired)
-
-            # otherwise, we got data or failure, handle it
+            receiver = asyncio.create_task(self._connection.recv())
+            timeouthandler = asyncio.create_task(self.handle_timeouts())
+            (done, _) = await asyncio.wait((receiver, timeouthandler), return_when=asyncio.FIRST_COMPLETED)
+            _.pop().cancel()
+            task = done.pop()
             try:
-                data = done.pop().result()
+                data = task.result()
             except WebSocketException as exc:
                 recovered = await self.handle_websocket_failure(exc)
                 if recovered:
                     continue
+            # other exceptions are left uncaught, they should bubble up
             else:
+                # successful timeout recovery
+                if not data:
+                    continue
                 try:
                     message = ujson.loads(data)
                 except ValueError:
@@ -217,12 +220,14 @@ class Channel:
 
     def handle_heartbeat(self):
         self._logger.debug("got heartbeat")
+        self._timeouts.reschedule(TIMEOUT.NoHeartbeat)
 
     def handle_404(self, msg):
         raise ChannelFailure(REASON.Ambiguous, message=msg)
 
     def handle_healthcheck_reply(self):
         self._logger.info("got health check reply")
+        self._timeouts.cancel(TIMEOUT.NoHealthCheckResponse)
 
     def handle_close_warning(self):
         self._logger.warning("received close warning, rollover required to avoid channel shutdown")
@@ -230,10 +235,17 @@ class Channel:
 
     def handle_subscription_success(self):
         self._logger.info("topic subscription successful")
+        self._timeouts.cancel(TIMEOUT.NoSubscriptionConfirmation)
 
     def handle_subscription_failure(self, msg):
         raise SubscriptionFailure(REASON.Ambiguous, message=msg)
 
+    async def check(self):
+        "send a health check"
+        msg = {"message": "ping"}
+        await self._connection.send(ujson.dumps(msg))
+        self._logger.debug("health check sent")
+        self._timeouts.schedule(TIMEOUT.NoHealthCheckResponse, self._response_timeout)
 
     async def extend(self):
         "extend channel lifetime by resubscribing to the topics"
@@ -244,8 +256,10 @@ class Channel:
             raise LifetimeExtensionFailure(exc.reason) from exc
         else:
             self._extensions += 1
+            self._timeouts.reschedule(TIMEOUT.ChannelExpired)
             self._logger.debug("successfully extended the channel lifetime (round %i)", self._extensions)
-            await self.schedule_expiry()
+            expiry_at = self._timeouts[TIMEOUT.ChannelExpired].expected.isoformat(" ", timespec="seconds")
+            self._logger.info("next managed expiry scheduled at %s", expiry_at)
 
 
     async def close(self):
@@ -297,11 +311,35 @@ class Channel:
             self._logger.debug("successfully rolled over to a new URI (round %i)", self._rollovers)
 
 
-    async def schedule_expiry(self):
-        try:
-            self._expiretrigger.cancel()
-        except:
-            pass
-        self._expiretrigger = asyncio.create_task(asyncio.sleep(self._lifetime))
-        self._expiration = datetime.now() + timedelta(seconds=self._lifetime)
-        self._logger.info("next managed expiry scheduled at %s", self._expiration.isoformat(" ", timespec="seconds"))
+    async def handle_timeouts(self):
+        event = await self._timeouts
+        match event:
+            case TIMEOUT.ChannelExpired:
+                await self.handle_ChannelExpired()
+            case TIMEOUT.NoHeartbeat:
+                await self.handle_NoHeartbeat()
+            case TIMEOUT.NoHealthCheckResponse:
+                await self.handle_NoHealthCheckResponse()
+            case TIMEOUT.NoSubscriptionConfirmation:
+                await self.handle_NoSubscriptionConfirmation()
+
+
+    async def handle_ChannelExpired(self):
+        self._logger.warning("managed expiry triggered")
+        if self._autoextend:
+            await self.extend()
+        else:
+            raise ChannelExpiring(REASON.ChannelExpired)
+
+    async def handle_NoHeartbeat(self):
+        self._logger.error("heartbeat timed out")
+        await self.reconnect()
+
+    async def handle_NoHealthCheckResponse(self):
+        self._logger.error("health check response timed out")
+        await self.reconnect()
+
+    async def handle_NoSubscriptionConfirmation(self):
+        self._logger.warning("subscription confirmation timed out")
+        await self.reconnect()
+        await self.subscribe()
